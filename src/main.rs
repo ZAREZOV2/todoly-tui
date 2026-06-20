@@ -21,6 +21,8 @@ use ratatui::{
 const FILE_PATH: &str = "tasks.txt";
 const TRASH_PATH: &str = "trash.txt";
 
+mod ai;
+
 // Приоритеты задач
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Priority {
@@ -224,6 +226,7 @@ enum InputMode {
     Adding,
     EditingTitle,
     Searching,
+    AiPrompt,
 }
 
 // Режимы просмотра
@@ -265,6 +268,7 @@ struct App {
     show_confirm: bool,
     confirm_action: Option<ConfirmAction>,
     update_status: UpdateStatus,
+    ai_generating: bool,
 }
 
 impl App {
@@ -293,6 +297,7 @@ impl App {
             show_confirm: false,
             confirm_action: None,
             update_status: UpdateStatus::Checking,
+            ai_generating: false,
         }
     }
 
@@ -490,7 +495,9 @@ fn main() -> Result<(), io::Error> {
         let _ = update_tx.send(status);
     });
 
-    let res = run_app(&mut terminal, app, update_rx);
+    let (ai_tx, ai_rx) = std::sync::mpsc::channel();
+
+    let res = run_app(&mut terminal, app, update_rx, ai_rx, ai_tx);
 
     disable_raw_mode()?;
     execute!(
@@ -511,11 +518,38 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut app: App,
     update_rx: std::sync::mpsc::Receiver<UpdateStatus>,
+    ai_rx: std::sync::mpsc::Receiver<Result<Vec<String>, String>>,
+    ai_tx: std::sync::mpsc::Sender<Result<Vec<String>, String>>,
 ) -> io::Result<()> {
     loop {
         if app.update_status == UpdateStatus::Checking {
             if let Ok(status) = update_rx.try_recv() {
                 app.update_status = status;
+            }
+        }
+
+        // Проверяем наличие результатов генерации ИИ
+        if app.ai_generating {
+            if let Ok(result) = ai_rx.try_recv() {
+                app.ai_generating = false;
+                if let Ok(new_tasks) = result {
+                    let now_str = chrono::Local::now()
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string();
+                    for task_title in new_tasks {
+                        app.tasks.push(Task {
+                            title: task_title,
+                            completed: false,
+                            priority: Priority::Medium,
+                            created_at: now_str.clone(),
+                            modified_at: now_str.clone(),
+                        });
+                    }
+                    save_tasks_to_file(&app.tasks, FILE_PATH);
+                    if !app.tasks.is_empty() {
+                        app.list_state.select(Some(app.tasks.len() - 1));
+                    }
+                }
             }
         }
 
@@ -743,7 +777,11 @@ fn run_app(
             // 3. Отрисовка панели действий / строки ввода
             let footer_text = match app.input_mode {
                 InputMode::Normal => {
-                    " F1 - Справка | F2 - О программе | q/й - Выход ".to_string()
+                    if app.ai_generating {
+                        " [ИИ-АССИСТЕНТ] Локальный ИИ генерирует подзадачи... Пожалуйста, подождите. ".to_string()
+                    } else {
+                        " F1 - Справка | F2 - О программе | i/ш - ИИ-помощник | q/й - Выход ".to_string()
+                    }
                 }
                 InputMode::Adding => {
                     format!(
@@ -760,6 +798,12 @@ fn run_app(
                 InputMode::Searching => {
                     format!(
                         " [ПОИСК] Запрос: {} (Enter — зафиксировать поиск, Esc — сбросить поиск)",
+                        app.input
+                    )
+                }
+                InputMode::AiPrompt => {
+                    format!(
+                        " [ИИ-АССИСТЕНТ] Запрос на генерацию подзадач: {} (Enter — сгенерировать, Esc — отмена)",
                         app.input
                     )
                 }
@@ -785,6 +829,10 @@ fn run_app(
                     ratatui::text::Line::from(vec![
                         ratatui::text::Span::styled("Добавление задач:  ", Style::default().add_modifier(Modifier::BOLD).fg(theme.accent)),
                         ratatui::text::Span::raw("Клавиша 'a' (или 'ф'). Введите имя и нажмите Enter."),
+                    ]),
+                    ratatui::text::Line::from(vec![
+                        ratatui::text::Span::styled("ИИ-Ассистент:      ", Style::default().add_modifier(Modifier::BOLD).fg(theme.accent)),
+                        ratatui::text::Span::raw("Клавиша 'i' (или 'ш'). Генерация списка из 5 подзадач локальной моделью."),
                     ]),
                     ratatui::text::Line::from(vec![
                         ratatui::text::Span::styled("Редактирование:    ", Style::default().add_modifier(Modifier::BOLD).fg(theme.accent)),
@@ -938,6 +986,58 @@ fn run_app(
                 f.render_widget(Clear, area); // Очищаем фон за модальным окном
                 f.render_widget(confirm_widget, area);
             }
+
+            // Рисуем всплывающее окно ввода промпта для ИИ
+            if let InputMode::AiPrompt = app.input_mode {
+                let area = centered_rect(65, 25, f.area());
+                let block = Block::default()
+                    .title(" ИИ-Ассистент: Создать подзадачи ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent));
+
+                let text = vec![
+                    ratatui::text::Line::from(""),
+                    ratatui::text::Line::from(" Опишите вашу цель на русском (например: 'Подготовка к Rust-интервью'):"),
+                    ratatui::text::Line::from(""),
+                    ratatui::text::Line::from(ratatui::text::Span::styled(
+                        format!(" > {}", app.input),
+                        Style::default().add_modifier(Modifier::BOLD).fg(Color::White),
+                    )),
+                ];
+
+                let widget = Paragraph::new(text)
+                    .block(block)
+                    .alignment(ratatui::layout::Alignment::Left);
+
+                f.render_widget(Clear, area);
+                f.render_widget(widget, area);
+            }
+
+            // Рисуем индикатор генерации ИИ
+            if app.ai_generating {
+                let area = centered_rect(50, 20, f.area());
+                let block = Block::default()
+                    .title(" ИИ-Ассистент ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent));
+
+                let text = vec![
+                    ratatui::text::Line::from(""),
+                    ratatui::text::Line::from(ratatui::text::Span::styled(
+                        " Локальный ИИ (SmolLM2) думает... ",
+                        Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow),
+                    )),
+                    ratatui::text::Line::from(""),
+                    ratatui::text::Line::from(" Генерация списка из 5 подзадач. Пожалуйста, подождите... "),
+                ];
+
+                let widget = Paragraph::new(text)
+                    .block(block)
+                    .alignment(ratatui::layout::Alignment::Center);
+
+                f.render_widget(Clear, area);
+                f.render_widget(widget, area);
+            }
         })?;
 
         // Считываем и обрабатываем клавиатурные события
@@ -1064,6 +1164,7 @@ fn run_app(
                             'c' | 'с' | 'C' | 'С' => 'c',
                             'j' | 'о' | 'J' | 'О' => 'j',
                             'k' | 'л' | 'K' | 'Л' => 'k',
+                            'i' | 'ш' | 'I' | 'Ш' => 'i',
                             ' ' => ' ',
                             '/' | '.' => '/',
                             other => other,
@@ -1074,6 +1175,12 @@ fn run_app(
                             'j' => app.next(),
                             'k' => app.previous(),
                             ' ' => app.toggle_or_restore(),
+                            'i' => {
+                                if app.view_mode == ViewMode::Active && !app.ai_generating {
+                                    app.input_mode = InputMode::AiPrompt;
+                                    app.input.clear();
+                                }
+                            }
                             't' => {
                                 app.current_theme_index = (app.current_theme_index + 1) % THEMES.len();
                             }
@@ -1305,6 +1412,32 @@ fn run_app(
                         app.search_query = app.input.clone();
                         app.list_state.select(Some(0));
                         app.trash_list_state.select(Some(0));
+                    }
+                    _ => {}
+                },
+                InputMode::AiPrompt => match key.code {
+                    KeyCode::Enter => {
+                        let prompt = app.input.trim().to_string();
+                        if !prompt.is_empty() {
+                            app.ai_generating = true;
+                            let tx = ai_tx.clone();
+                            std::thread::spawn(move || {
+                                let result = ai::generate_subtasks(&prompt);
+                                let _ = tx.send(result);
+                            });
+                        }
+                        app.input.clear();
+                        app.input_mode = InputMode::Normal;
+                    }
+                    KeyCode::Esc => {
+                        app.input.clear();
+                        app.input_mode = InputMode::Normal;
+                    }
+                    KeyCode::Char(c) => {
+                        app.input.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        app.input.pop();
                     }
                     _ => {}
                 }
