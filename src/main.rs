@@ -1287,7 +1287,7 @@ fn run_app(
                                         let progress = app.ai_download_progress.clone();
                                         let tx = ai_tx.clone();
                                         std::thread::spawn(move || {
-                                            let res = download_ai_files(progress);
+                                            let res = ai::download_ai_files(progress);
                                             let _ = tx.send(res);
                                         });
                                     }
@@ -1615,67 +1615,4 @@ fn check_github_update() -> Result<String, String> {
     }
     
     Err("Could not parse tag_name from GitHub API response".to_string())
-}
-
-// Функция для фонового скачивания файлов ИИ
-fn download_ai_files(progress: std::sync::Arc<std::sync::atomic::AtomicU32>) -> Result<Vec<String>, String> {
-    use std::io::Read;
-    
-    let dir = ai::get_ai_dir();
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    }
-    let (model_path, tokenizer_path) = ai::get_model_paths();
-
-    let agent = ureq::AgentBuilder::new()
-        .timeout_read(std::time::Duration::from_secs(600))
-        .timeout_connect(std::time::Duration::from_secs(15))
-        .build();
-
-    // 1. Скачивание токенизатора (~2MB)
-    if !tokenizer_path.exists() {
-        let response = agent.get("https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main/tokenizer.json")
-            .set("User-Agent", "ToDoLy-TUI")
-            .call()
-            .map_err(|e| format!("Ошибка скачивания токенизатора: {}", e))?;
-        
-        let mut out = std::fs::File::create(&tokenizer_path).map_err(|e| e.to_string())?;
-        let mut reader = response.into_reader();
-        std::io::copy(&mut reader, &mut out).map_err(|e| e.to_string())?;
-    }
-    progress.store(5, std::sync::atomic::Ordering::Relaxed);
-
-    // 2. Скачивание модели (~90MB)
-    if !model_path.exists() {
-        let response = agent.get("https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf")
-            .set("User-Agent", "ToDoLy-TUI")
-            .call()
-            .map_err(|e| format!("Ошибка скачивания модели: {}", e))?;
-            
-        let total_size = response.header("Content-Length")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(94_800_000);
-
-        let mut out = std::fs::File::create(&model_path).map_err(|e| e.to_string())?;
-        let mut reader = response.into_reader();
-        
-        let mut buffer = vec![0; 64 * 1024];
-        let mut downloaded = 0;
-        
-        loop {
-            let bytes_read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
-            if bytes_read == 0 {
-                break;
-            }
-            out.write_all(&buffer[..bytes_read]).map_err(|e| e.to_string())?;
-            downloaded += bytes_read;
-            
-            let percent = 5 + ((downloaded as f32 / total_size as f32) * 95.0) as u32;
-            progress.store(percent.min(100), std::sync::atomic::Ordering::Relaxed);
-        }
-    } else {
-        progress.store(100, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    Ok(Vec::new()) // Успех
 }
