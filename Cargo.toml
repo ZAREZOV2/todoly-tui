@@ -11,6 +11,3 @@ ureq = { version = "2.10.1", features = ["tls"] }
 candle-core = "0.8.0"
 candle-transformers = "0.8.0"
 tokenizers = { version = "0.21.0", default-features = false, features = ["onig"] }
-
-[build-dependencies]
-ureq = { version = "2.10.1", features = ["tls"] }

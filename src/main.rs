@@ -269,6 +269,9 @@ struct App {
     confirm_action: Option<ConfirmAction>,
     update_status: UpdateStatus,
     ai_generating: bool,
+    ai_downloading: bool,
+    ai_download_progress: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ai_error: Option<String>,
 }
 
 impl App {
@@ -298,6 +301,9 @@ impl App {
             confirm_action: None,
             update_status: UpdateStatus::Checking,
             ai_generating: false,
+            ai_downloading: false,
+            ai_download_progress: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            ai_error: None,
         }
     }
 
@@ -528,26 +534,42 @@ fn run_app(
             }
         }
 
-        // Проверяем наличие результатов генерации ИИ
-        if app.ai_generating {
-            if let Ok(result) = ai_rx.try_recv() {
-                app.ai_generating = false;
-                if let Ok(new_tasks) = result {
-                    let now_str = chrono::Local::now()
-                        .format("%Y-%m-%d %H:%M:%S")
-                        .to_string();
-                    for task_title in new_tasks {
-                        app.tasks.push(Task {
-                            title: task_title,
-                            completed: false,
-                            priority: Priority::Medium,
-                            created_at: now_str.clone(),
-                            modified_at: now_str.clone(),
-                        });
+        // Проверяем результаты фоновых задач ИИ (скачивание или генерация)
+        if let Ok(result) = ai_rx.try_recv() {
+            if app.ai_downloading {
+                app.ai_downloading = false;
+                match result {
+                    Ok(_) => {
+                        app.input_mode = InputMode::AiPrompt;
+                        app.input.clear();
                     }
-                    save_tasks_to_file(&app.tasks, FILE_PATH);
-                    if !app.tasks.is_empty() {
-                        app.list_state.select(Some(app.tasks.len() - 1));
+                    Err(e) => {
+                        app.ai_error = Some(e);
+                    }
+                }
+            } else if app.ai_generating {
+                app.ai_generating = false;
+                match result {
+                    Ok(new_tasks) => {
+                        let now_str = chrono::Local::now()
+                            .format("%Y-%m-%d %H:%M:%S")
+                            .to_string();
+                        for task_title in new_tasks {
+                            app.tasks.push(Task {
+                                title: task_title,
+                                completed: false,
+                                priority: Priority::Medium,
+                                created_at: now_str.clone(),
+                                modified_at: now_str.clone(),
+                            });
+                        }
+                        save_tasks_to_file(&app.tasks, FILE_PATH);
+                        if !app.tasks.is_empty() {
+                            app.list_state.select(Some(app.tasks.len() - 1));
+                        }
+                    }
+                    Err(e) => {
+                        app.ai_error = Some(e);
                     }
                 }
             }
@@ -1038,6 +1060,82 @@ fn run_app(
                 f.render_widget(Clear, area);
                 f.render_widget(widget, area);
             }
+
+            // Рисуем всплывающее окно скачивания ИИ модели
+            if app.ai_downloading {
+                let area = centered_rect(60, 25, f.area());
+                let block = Block::default()
+                    .title(" ИИ-Ассистент: Загрузка модели ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent));
+
+                let pct = app.ai_download_progress.load(std::sync::atomic::Ordering::Relaxed);
+                
+                let progress_gauge = Gauge::default()
+                    .block(Block::default().borders(Borders::NONE))
+                    .gauge_style(
+                        Style::default()
+                            .fg(theme.accent)
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .percent(pct as u16);
+
+                let text = vec![
+                    ratatui::text::Line::from(""),
+                    ratatui::text::Line::from(" Скачивание локальной модели ИИ (SmolLM2, ~90 МБ)..."),
+                    ratatui::text::Line::from(" Это требуется только при первом запуске ассистента."),
+                    ratatui::text::Line::from(""),
+                ];
+
+                let paragraph = Paragraph::new(text)
+                    .block(block)
+                    .alignment(ratatui::layout::Alignment::Left);
+
+                f.render_widget(Clear, area);
+                f.render_widget(paragraph, area);
+                
+                let inner_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(5),
+                        Constraint::Length(3),
+                        Constraint::Min(0),
+                    ])
+                    .split(area);
+                f.render_widget(progress_gauge, inner_layout[1]);
+            }
+
+            // Рисуем всплывающее окно ошибки ИИ
+            if let Some(err_msg) = &app.ai_error {
+                let area = centered_rect(60, 30, f.area());
+                let block = Block::default()
+                    .title(" Ошибка ИИ-Ассистента ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red));
+
+                let text = vec![
+                    ratatui::text::Line::from(""),
+                    ratatui::text::Line::from(ratatui::text::Span::styled(
+                        " Произошла ошибка при работе с ИИ: ",
+                        Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+                    )),
+                    ratatui::text::Line::from(""),
+                    ratatui::text::Line::from(err_msg.as_str()),
+                    ratatui::text::Line::from(""),
+                    ratatui::text::Line::from(ratatui::text::Span::styled(
+                        " Нажмите Esc для закрытия этого сообщения. ",
+                        Style::default().fg(Color::Gray),
+                    )),
+                ];
+
+                let widget = Paragraph::new(text)
+                    .block(block)
+                    .alignment(ratatui::layout::Alignment::Center);
+
+                f.render_widget(Clear, area);
+                f.render_widget(widget, area);
+            }
         })?;
 
         // Считываем и обрабатываем клавиатурные события
@@ -1100,12 +1198,13 @@ fn run_app(
                 continue;
             }
 
-            // 3. Закрытие окон F1 / F2 по Esc
-            if app.show_help || app.show_about {
+            // 3. Закрытие окон F1 / F2 / Ошибок по Esc
+            if app.show_help || app.show_about || app.ai_error.is_some() {
                 match key.code {
                     KeyCode::Esc => {
                         app.show_help = false;
                         app.show_about = false;
+                        app.ai_error = None;
                     }
                     KeyCode::F(1) if app.show_help => app.show_help = false,
                     KeyCode::F(2) if app.show_about => app.show_about = false,
@@ -1176,9 +1275,22 @@ fn run_app(
                             'k' => app.previous(),
                             ' ' => app.toggle_or_restore(),
                             'i' => {
-                                if app.view_mode == ViewMode::Active && !app.ai_generating {
-                                    app.input_mode = InputMode::AiPrompt;
-                                    app.input.clear();
+                                if app.view_mode == ViewMode::Active && !app.ai_generating && !app.ai_downloading {
+                                    let (model_path, tokenizer_path) = ai::get_model_paths();
+                                    if model_path.exists() && tokenizer_path.exists() {
+                                        app.input_mode = InputMode::AiPrompt;
+                                        app.input.clear();
+                                    } else {
+                                        app.ai_downloading = true;
+                                        app.ai_download_progress.store(0, std::sync::atomic::Ordering::Relaxed);
+                                        app.ai_error = None;
+                                        let progress = app.ai_download_progress.clone();
+                                        let tx = ai_tx.clone();
+                                        std::thread::spawn(move || {
+                                            let res = download_ai_files(progress);
+                                            let _ = tx.send(res);
+                                        });
+                                    }
                                 }
                             }
                             't' => {
@@ -1503,4 +1615,67 @@ fn check_github_update() -> Result<String, String> {
     }
     
     Err("Could not parse tag_name from GitHub API response".to_string())
+}
+
+// Функция для фонового скачивания файлов ИИ
+fn download_ai_files(progress: std::sync::Arc<std::sync::atomic::AtomicU32>) -> Result<Vec<String>, String> {
+    use std::io::Read;
+    
+    let dir = ai::get_ai_dir();
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
+    let (model_path, tokenizer_path) = ai::get_model_paths();
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_read(std::time::Duration::from_secs(600))
+        .timeout_connect(std::time::Duration::from_secs(15))
+        .build();
+
+    // 1. Скачивание токенизатора (~2MB)
+    if !tokenizer_path.exists() {
+        let response = agent.get("https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main/tokenizer.json")
+            .set("User-Agent", "ToDoLy-TUI")
+            .call()
+            .map_err(|e| format!("Ошибка скачивания токенизатора: {}", e))?;
+        
+        let mut out = std::fs::File::create(&tokenizer_path).map_err(|e| e.to_string())?;
+        let mut reader = response.into_reader();
+        std::io::copy(&mut reader, &mut out).map_err(|e| e.to_string())?;
+    }
+    progress.store(5, std::sync::atomic::Ordering::Relaxed);
+
+    // 2. Скачивание модели (~90MB)
+    if !model_path.exists() {
+        let response = agent.get("https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf")
+            .set("User-Agent", "ToDoLy-TUI")
+            .call()
+            .map_err(|e| format!("Ошибка скачивания модели: {}", e))?;
+            
+        let total_size = response.header("Content-Length")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(94_800_000);
+
+        let mut out = std::fs::File::create(&model_path).map_err(|e| e.to_string())?;
+        let mut reader = response.into_reader();
+        
+        let mut buffer = vec![0; 64 * 1024];
+        let mut downloaded = 0;
+        
+        loop {
+            let bytes_read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+            if bytes_read == 0 {
+                break;
+            }
+            out.write_all(&buffer[..bytes_read]).map_err(|e| e.to_string())?;
+            downloaded += bytes_read;
+            
+            let percent = 5 + ((downloaded as f32 / total_size as f32) * 95.0) as u32;
+            progress.store(percent.min(100), std::sync::atomic::Ordering::Relaxed);
+        }
+    } else {
+        progress.store(100, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    Ok(Vec::new()) // Успех
 }

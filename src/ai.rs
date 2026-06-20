@@ -2,19 +2,30 @@ use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 use candle_transformers::models::quantized_llama::ModelWeights;
 use tokenizers::Tokenizer;
+use std::path::PathBuf;
 
-// Вшиваем модель и токенизатор в бинарный файл
-const MODEL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/model.gguf"));
-const TOKENIZER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tokenizer.json"));
+pub fn get_ai_dir() -> PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home).join(".todoly-tui")
+}
+
+pub fn get_model_paths() -> (PathBuf, PathBuf) {
+    let dir = get_ai_dir();
+    (dir.join("model.gguf"), dir.join("tokenizer.json"))
+}
 
 pub fn generate_subtasks(user_prompt: &str) -> Result<Vec<String>, String> {
-    // 1. Инициализация токенизатора из памяти
-    let tokenizer = Tokenizer::from_bytes(TOKENIZER_BYTES).map_err(|e| e.to_string())?;
+    let (model_path, tokenizer_path) = get_model_paths();
 
-    // 2. Инициализация модели из памяти на CPU
-    let mut reader = std::io::Cursor::new(MODEL_BYTES);
-    let gguf = gguf_file::Content::read(&mut reader).map_err(|e| e.to_string())?;
-    let mut model = ModelWeights::from_gguf(gguf, &mut reader, &Device::Cpu).map_err(|e| e.to_string())?;
+    // 1. Инициализация токенизатора из файла
+    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| e.to_string())?;
+
+    // 2. Инициализация модели из файла на CPU
+    let mut file = std::fs::File::open(&model_path).map_err(|e| e.to_string())?;
+    let gguf = gguf_file::Content::read(&mut file).map_err(|e| e.to_string())?;
+    let mut model = ModelWeights::from_gguf(gguf, &mut file, &Device::Cpu).map_err(|e| e.to_string())?;
 
     // 3. Подготовка системного промпта и формата диалога для SmolLM2-Instruct
     let prompt = format!(
